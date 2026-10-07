@@ -1,13 +1,17 @@
 """
 ================================================================================
-Project: Modern PDF Reader & Note Studio (พร้อมระบบ Highlight คำค้นหา)
-Tool: Python 3, PyQt6, PyMuPDF (fitz)
+Project: Modern PDF Reader & Note Studio 
+         (Smart Voice Reader อ่านลงล่างเฉพาะเนื้อหาใต้คำค้นหา จบแล้วหยุดทันที ไม่วนลูป)
+Tool: Python 3, PyQt6, PyMuPDF, Ollama, macOS Speech
 ================================================================================
 """
 
 import sys
 import os
-import fitz  
+import re
+import subprocess
+import pymupdf as fitz
+import ollama
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -15,27 +19,105 @@ from PyQt6.QtWidgets import (
     QLineEdit, QFileDialog, QSplitter, QGroupBox, QScrollArea,
     QTabWidget, QMessageBox, QToolBar, QSpinBox
 )
-from PyQt6.QtCore import Qt, QSize, QRectF
+from PyQt6.QtCore import Qt, QSize, QRectF, QThread, pyqtSignal
 from PyQt6.QtGui import (
     QPixmap, QImage, QIcon, QFont, QAction, QKeySequence, 
     QPainter, QColor
 )
 
 
+# ==============================================================================
+# 1. เธรดทำงานเบื้องหลังสำหรับ Ollama AI
+# ==============================================================================
+class OllamaWorker(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, text, model="qwen2.5:7b"):
+        super().__init__()
+        self.text = text
+        self.model = model
+        self.is_cancelled = False
+
+    def run(self):
+        try:
+            prompt = (
+                "คุณคือผู้ช่วยวิเคราะห์เอกสารอัจฉริยะ "
+                "โปรดสรุปใจความสำคัญและวิเคราะห์เนื้อหาต่อไปนี้เป็นภาษาไทย "
+                "ให้อ่านเข้าใจง่าย กระชับ และจัดเป็นหัวข้อย่อย:\n\n"
+                f"{self.text}"
+            )
+            response = ollama.chat(
+                model=self.model,
+                messages=[{'role': 'user', 'content': prompt}]
+            )
+            if not self.is_cancelled:
+                self.finished.emit(response['message']['content'])
+        except Exception as e:
+            if not self.is_cancelled:
+                self.error.emit(str(e))
+
+
+# ==============================================================================
+# 2. เธรดอ่านเสียง TTS (ตรวจจับภาษาไทยและเลือกเสียง Kanya ให้อัตโนมัติ)
+# ==============================================================================
+class TTSWorker(QThread):
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+        self.process = None
+
+    def run(self):
+        try:
+            has_thai = any('\u0e00' <= char <= '\u0e7f' for char in self.text)
+            cmd = ["say"]
+            if has_thai:
+                thai_voice = self.find_thai_voice()
+                cmd.extend(["-v", thai_voice])
+
+            cmd.append(self.text)
+            self.process = subprocess.Popen(cmd)
+            self.process.wait()
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def find_thai_voice(self):
+        try:
+            out = subprocess.check_output(["say", "-v", "?"], text=True)
+            for line in out.splitlines():
+                if "th_TH" in line or "th-TH" in line:
+                    return line.split()[0]
+        except Exception:
+            pass
+        return "Kanya"
+
+    def stop(self):
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait()
+
+
+# ==============================================================================
+# 3. หน้าต่างหลักของโปรแกรม
+# ==============================================================================
 class PDFReaderApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Modern PDF Reader & Workspace")
+        self.setWindowTitle("Modern PDF Reader & Workspace (AI & Smart Voice)")
         self.resize(1200, 800)
 
-        # ตัวแปรจัดการเอกสาร
         self.doc = None
         self.current_page = 0
         self.total_pages = 0
         self.zoom_factor = 1.25
-
-        # ตัวแปรเก็บคำค้นหาปัจจุบันสำหรับทำ Highlight
         self.current_search_query = ""
+
+        self.ai_worker = None
+        self.tts_worker = None
 
         self.init_ui()
 
@@ -50,9 +132,7 @@ class PDFReaderApp(QMainWindow):
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(self.splitter)
 
-        # ----------------------------------------------------------------------
         # 1. แผงซ้าย: Thumbnails
-        # ----------------------------------------------------------------------
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.addWidget(QLabel("📑 หน้าเอกสาร (Pages)"))
@@ -63,9 +143,7 @@ class PDFReaderApp(QMainWindow):
         left_layout.addWidget(self.thumbnail_list)
         self.splitter.addWidget(left_panel)
 
-        # ----------------------------------------------------------------------
         # 2. แผงกลาง: หน้าอ่าน PDF
-        # ----------------------------------------------------------------------
         center_panel = QWidget()
         center_layout = QVBoxLayout(center_panel)
 
@@ -100,15 +178,13 @@ class PDFReaderApp(QMainWindow):
 
         self.splitter.addWidget(center_panel)
 
-        # ----------------------------------------------------------------------
-        # 3. แผงขวา: มี 2 แท็บ (🔍 ค้นหาคำ และ 📝 โน้ตสรุป)
-        # ----------------------------------------------------------------------
+        # 3. แผงขวา: ค้นหาคำ + โน้ตสรุป + ควบคุม AI & อ่านเสียง
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
 
         tabs = QTabWidget()
 
-        # --- แท็บ 1: ค้นหาคำ (ขนาดเท่ากันเป๊ะ) ---
+        # --- แท็บ 1: ค้นหาคำ ---
         search_tab = QWidget()
         st_layout = QVBoxLayout(search_tab)
         
@@ -116,7 +192,6 @@ class PDFReaderApp(QMainWindow):
         search_bar.setSpacing(6)
         search_bar.setContentsMargins(0, 0, 0, 0)
 
-        # ช่องพิมพ์ค้นหา
         self.txt_search = QLineEdit()
         self.txt_search.setPlaceholderText("พิมพ์คำที่ต้องการค้นหา...")
         self.txt_search.returnPressed.connect(self.search_text)
@@ -135,7 +210,6 @@ class PDFReaderApp(QMainWindow):
             }
         """)
 
-        # ปุ่มค้นหา
         self.btn_search = QPushButton("🔍 ค้นหา")
         self.btn_search.clicked.connect(self.search_text)
         self.btn_search.setFixedHeight(38)
@@ -156,7 +230,6 @@ class PDFReaderApp(QMainWindow):
             }
         """)
 
-        # ปุ่มล้างไฮไลต์ (✖) จัตุรัส 38x38 px
         self.btn_clear_search = QPushButton("✖")
         self.btn_clear_search.setToolTip("ล้างการค้นหาและเอาไฮไลต์ออก")
         self.btn_clear_search.clicked.connect(self.clear_search)
@@ -182,17 +255,106 @@ class PDFReaderApp(QMainWindow):
         search_bar.addWidget(self.btn_clear_search)
         st_layout.addLayout(search_bar)
 
+        # ปุ่มฟังเสียงในแท็บค้นหา
+        self.btn_tts_search = QPushButton("🔊 ฟังเนื้อหาตรงคำค้นหา")
+        self.btn_tts_search.setFixedHeight(34)
+        self.btn_tts_search.setStyleSheet("""
+            QPushButton {
+                background-color: #059669;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #047857;
+            }
+        """)
+        self.btn_tts_search.clicked.connect(self.toggle_tts)
+        st_layout.addWidget(self.btn_tts_search)
+
         self.search_results = QListWidget()
         self.search_results.itemClicked.connect(self.on_search_result_clicked)
         st_layout.addWidget(self.search_results)
         tabs.addTab(search_tab, "🔍 ค้นหาคำ")
 
-        # --- แท็บ 2: จดโน้ต (ลบปุ่มบันทึกลงไฟล์ออกแล้ว) ---
+        # --- แท็บ 2: จดโน้ต + AI + เสียง ---
         note_tab = QWidget()
         nt_layout = QVBoxLayout(note_tab)
+
+        ai_btn_layout = QHBoxLayout()
+        ai_btn_layout.setSpacing(6)
+
+        self.btn_ai = QPushButton("✨ วิเคราะห์หน้านี้ด้วย AI")
+        self.btn_ai.setFixedHeight(38)
+        self.btn_ai.setStyleSheet("""
+            QPushButton {
+                background-color: #2563EB;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #1D4ED8;
+            }
+            QPushButton:disabled {
+                background-color: #3f3f46;
+                color: #71717a;
+            }
+        """)
+        self.btn_ai.clicked.connect(self.analyze_page_with_ollama)
+
+        self.btn_cancel_ai = QPushButton("🛑 ยกเลิก")
+        self.btn_cancel_ai.setFixedHeight(38)
+        self.btn_cancel_ai.setEnabled(False)
+        self.btn_cancel_ai.setStyleSheet("""
+            QPushButton {
+                background-color: #DC2626;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 13px;
+                padding: 0 14px;
+            }
+            QPushButton:hover {
+                background-color: #B91C1C;
+            }
+            QPushButton:disabled {
+                background-color: #27272a;
+                color: #52525b;
+            }
+        """)
+        self.btn_cancel_ai.clicked.connect(self.cancel_ai_processing)
+
+        ai_btn_layout.addWidget(self.btn_ai, stretch=3)
+        ai_btn_layout.addWidget(self.btn_cancel_ai, stretch=1)
+        nt_layout.addLayout(ai_btn_layout)
+
+        self.btn_tts_note = QPushButton("🔊 ฟังเสียงอ่าน (TTS)")
+        self.btn_tts_note.setFixedHeight(34)
+        self.btn_tts_note.setStyleSheet("""
+            QPushButton {
+                background-color: #059669;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #047857;
+            }
+        """)
+        self.btn_tts_note.clicked.connect(self.toggle_tts)
+        nt_layout.addWidget(self.btn_tts_note)
+
         self.txt_notes = QTextEdit()
-        self.txt_notes.setPlaceholderText("จดสรุปเนื้อหาสำคัญที่นี่...")
-        self.txt_notes.setStyleSheet("font-size: 13px;")
+        self.txt_notes.setPlaceholderText("จดสรุปเนื้อหา หรือกดปุ่มด้านบนเพื่อให้ AI ช่วยสรุป/อ่านออกเสียงให้ฟัง...")
+        self.txt_notes.setStyleSheet("font-size: 13px; padding: 6px;")
         nt_layout.addWidget(self.txt_notes)
         tabs.addTab(note_tab, "📝 โน้ตสรุป")
 
@@ -234,6 +396,8 @@ class PDFReaderApp(QMainWindow):
 
     def load_pdf(self, path):
         try:
+            self.stop_tts()
+
             self.doc = fitz.open(path)
             self.total_pages = len(self.doc)
             self.current_page = 0
@@ -262,7 +426,6 @@ class PDFReaderApp(QMainWindow):
             QMessageBox.critical(self, "เกิดข้อผิดพลาด", f"ไม่สามารถเปิดไฟล์ได้:\n{str(e)}")
 
     def render_page(self):
-        """เรนเดอร์หน้า PDF และวาด Highlight ทับถ้ามีคำค้นหา"""
         if not self.doc or self.current_page >= self.total_pages:
             return
 
@@ -306,6 +469,7 @@ class PDFReaderApp(QMainWindow):
 
     def go_to_page(self, page_index):
         if self.doc and 0 <= page_index < self.total_pages:
+            self.stop_tts()
             self.current_page = page_index
             self.spin_page.blockSignals(True)
             self.spin_page.setValue(page_index + 1)
@@ -355,6 +519,8 @@ class PDFReaderApp(QMainWindow):
                 item.setData(Qt.ItemDataRole.UserRole, i)
                 self.search_results.addItem(item)
 
+        self.btn_tts_search.setText(f"🔊 ฟังเนื้อหาตรงคำค้นหา ('{query}')")
+
         if found_count == 0:
             self.search_results.addItem("❌ ไม่พบคำที่ค้นหา")
             self.render_page()
@@ -368,12 +534,205 @@ class PDFReaderApp(QMainWindow):
         self.current_search_query = ""
         self.txt_search.clear()
         self.search_results.clear()
+        self.btn_tts_search.setText("🔊 ฟังเนื้อหาตรงคำค้นหา")
         self.render_page()
 
     def on_search_result_clicked(self, item):
         page_num = item.data(Qt.ItemDataRole.UserRole)
         if page_num is not None:
             self.go_to_page(page_num)
+
+    # ==========================================================================
+    # ระบบควบคุม Ollama AI
+    # ==========================================================================
+    def analyze_page_with_ollama(self):
+        if not self.doc:
+            QMessageBox.warning(self, "แจ้งเตือน", "กรุณาเปิดไฟล์ PDF ก่อนใช้งาน AI")
+            return
+
+        page = self.doc.load_page(self.current_page)
+        page_text = page.get_text().strip()
+
+        if not page_text:
+            QMessageBox.warning(
+                self, "แจ้งเตือน", 
+                "ไม่พบข้อความในหน้านี้ (อาจเป็นรูปภาพล้วน หรือเอกสารสแกน)"
+            )
+            return
+
+        self.btn_ai.setEnabled(False)
+        self.btn_ai.setText("⏳ กำลังวิเคราะห์...")
+        self.btn_cancel_ai.setEnabled(True)
+
+        self.txt_notes.append(f"\n--- 🤖 [AI สรุปเนื้อหา หน้า {self.current_page + 1}] ---")
+        self.txt_notes.append("กำลังประมวลผล กรุณารอสักครู่ (กด 'ยกเลิก' ได้)...\n")
+
+        self.ai_worker = OllamaWorker(text=page_text, model="qwen2.5:7b")
+        self.ai_worker.finished.connect(self.on_ai_success)
+        self.ai_worker.error.connect(self.on_ai_failed)
+        self.ai_worker.start()
+
+    def cancel_ai_processing(self):
+        if self.ai_worker and self.ai_worker.isRunning():
+            self.ai_worker.is_cancelled = True
+            self.ai_worker.terminate()
+            self.ai_worker.wait(400)
+
+            current_text = self.txt_notes.toPlainText()
+            cleaned_text = current_text.replace(
+                "กำลังประมวลผล กรุณารอสักครู่ (กด 'ยกเลิก' ได้)...\n", ""
+            )
+            self.txt_notes.setText(cleaned_text + "❌ [ยกเลิกการวิเคราะห์โดยผู้ใช้]\n")
+
+        self.reset_ai_buttons()
+
+    def on_ai_success(self, summary_text):
+        current_text = self.txt_notes.toPlainText()
+        cleaned_text = current_text.replace(
+            "กำลังประมวลผล กรุณารอสักครู่ (กด 'ยกเลิก' ได้)...\n", ""
+        )
+        self.txt_notes.setText(cleaned_text + summary_text + "\n")
+        self.reset_ai_buttons()
+
+    def on_ai_failed(self, error_message):
+        self.reset_ai_buttons()
+        QMessageBox.critical(
+            self, "เกิดข้อผิดพลาดจาก Ollama",
+            f"ไม่สามารถเชื่อมต่อกับ Ollama ได้:\n{error_message}\n\n"
+            "คำแนะนำ: ตรวจสอบว่าได้เปิดโปรแกรม Ollama ในเครื่องแล้วหรือไม่"
+        )
+
+    def reset_ai_buttons(self):
+        self.btn_ai.setEnabled(True)
+        self.btn_ai.setText("✨ วิเคราะห์หน้านี้ด้วย AI")
+        self.btn_cancel_ai.setEnabled(False)
+
+    # ==========================================================================
+    # ระบบดึงเนื้อหาลงด้านล่างอย่างเดียว (ห้ามย้อนขึ้นบน + จบแล้วหยุดทันที)
+    # ==========================================================================
+    def extract_strictly_downward(self, full_text, query):
+        """
+        1. หาบรรทัดที่มีคำค้นหา
+        2. อ่านเฉพาะเนื้อหาตั้งแต่บรรทัดนั้น 'ไล่ลงล่าง' ไปเรื่อยๆ
+        3. หยุดทันทีเมื่อเจอหัวข้อใหม่ (เช่น 1.4, 2.) หรือหมดเนื้อหาหมวดนั้น
+        4. ตัดเลขหน้าท้ายกระดาษทิ้ง และไม่วนกลับไปอ่านด้านบนเด็ดขาด
+        """
+        lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+        start_idx = -1
+
+        for idx, line in enumerate(lines):
+            if query.lower() in line.lower():
+                start_idx = idx
+                break
+
+        if start_idx == -1:
+            return None
+
+        collected = []
+        start_line = lines[start_idx]
+        collected.append(start_line)
+
+        # ไล่อ่านเฉพาะบรรทัดที่อยู่ถัดลงไปด้านล่างเท่านั้น
+        for line in lines[start_idx + 1:]:
+            # ตัดเลขท้ายกระดาษ เช่น "หน้าที่ 1", "Page 1"
+            if re.match(r'^(หน้าที่|page)\s*\d+$', line.lower()):
+                break
+
+            # ตัดชื่อคำบรรยายภาพ เช่น "รูปที่ 1.1 ..."
+            if re.match(r'^(รูปที่|figure)\s*\d+', line.lower()):
+                break
+
+            # ถ้าเจอรหัสหัวข้อใหม่ที่ใหญ่กว่า (เช่น ค้นหา 1.3 แล้วมาเจอ 1.4 หรือ 2.) ให้หยุดทันที!
+            if re.match(r'^(\d+\.\d+|\d+\.)\s+', line) and not line.startswith(query):
+                break
+
+            collected.append(line)
+
+        # คืนค่าเฉพาะเนื้อหาที่เก็บได้
+        return " ".join(collected) if collected else None
+
+    def toggle_tts(self):
+        if self.tts_worker and self.tts_worker.isRunning():
+            self.stop_tts()
+            return
+
+        if not self.doc:
+            QMessageBox.warning(self, "แจ้งเตือน", "กรุณาเปิดไฟล์ PDF ก่อนใช้งาน")
+            return
+
+        page = self.doc.load_page(self.current_page)
+        page_text = page.get_text()
+        text_to_speak = ""
+
+        # 🎯 โหมดค้นหา: อ่านลงข้างล่างอย่างเดียว 100% (ห้ามวนขึ้นบน ห้ามอ่านทั้งหน้า)
+        if self.current_search_query:
+            text_to_speak = self.extract_strictly_downward(
+                page_text, self.current_search_query
+            )
+            if not text_to_speak:
+                QMessageBox.information(
+                    self, "แจ้งเตือน", 
+                    f"ไม่พบเนื้อหาของคำว่า '{self.current_search_query}' ในหน้านี้"
+                )
+                return
+        else:
+            # 📖 โหมดไม่ได้ค้นหา: อ่านบทสรุปของโน้ต ถ้าไม่มีให้อ่านทั้งหน้า
+            note_content = self.txt_notes.toPlainText().strip()
+            if note_content:
+                text_to_speak = note_content
+            else:
+                text_to_speak = page_text.strip()
+
+        if not text_to_speak:
+            QMessageBox.warning(self, "แจ้งเตือน", "ไม่พบข้อความสำหรับอ่านออกเสียง")
+            return
+
+        stop_style = """
+            QPushButton {
+                background-color: #DC2626;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #B91C1C;
+            }
+        """
+        self.btn_tts_search.setText("⏹️ หยุดอ่านเสียง")
+        self.btn_tts_search.setStyleSheet(stop_style)
+        self.btn_tts_note.setText("⏹️ หยุดอ่านเสียง")
+        self.btn_tts_note.setStyleSheet(stop_style)
+
+        self.tts_worker = TTSWorker(text=text_to_speak)
+        self.tts_worker.finished.connect(self.on_tts_finished)
+        self.tts_worker.error.connect(self.on_tts_finished)
+        self.tts_worker.start()
+
+    def stop_tts(self):
+        if self.tts_worker and self.tts_worker.isRunning():
+            self.tts_worker.stop()
+        self.on_tts_finished()
+
+    def on_tts_finished(self):
+        normal_style = """
+            QPushButton {
+                background-color: #059669;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #047857;
+            }
+        """
+        self.btn_tts_search.setText("🔊 ฟังเนื้อหาตรงคำค้นหา")
+        self.btn_tts_search.setStyleSheet(normal_style)
+        self.btn_tts_note.setText("🔊 ฟังเสียงอ่าน (TTS)")
+        self.btn_tts_note.setStyleSheet(normal_style)
 
 
 if __name__ == "__main__":
