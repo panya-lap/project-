@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS documents (
     total_pages integer NOT NULL CHECK (total_pages > 0),
     created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
--- Explicit page rows enforce both document membership and valid page numbers.
+-- แยกข้อมูลแต่ละหน้าเพื่อให้โน้ตและผลสรุปอ้างอิงหน้าที่มีอยู่ในเอกสาร
 CREATE TABLE IF NOT EXISTS document_pages (
     document_id bigint NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     page_number integer NOT NULL CHECK (page_number > 0),
