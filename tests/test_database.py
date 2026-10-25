@@ -1,4 +1,4 @@
-"""Integration tests: TEST_DATABASE_URL must target a dedicated test database."""
+"""ทดสอบร่วมกับฐานข้อมูลจริง โดย TEST_DATABASE_URL ต้องชี้ไปยังฐานข้อมูลสำหรับทดสอบโดยเฉพาะ"""
 import os
 from pathlib import Path
 import tempfile
@@ -17,7 +17,7 @@ class DatabaseTests(unittest.TestCase):
             conn.execute(Path('database/schema.sql').read_text(encoding='utf-8'))
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'example.pdf'
-            path.write_bytes(os.urandom(64))  # Store hashes bytes; GUI parses the actual PDF.
+            path.write_bytes(os.urandom(64))  # โมดูลจัดเก็บคำนวณ hash จากไบต์ ส่วนหน้าต่างโปรแกรมเป็นผู้เปิดอ่าน PDF จริง
             doc_id = db.register_document(path, 2)
             try:
                 renamed = path.rename(Path(folder) / 'renamed.pdf')
