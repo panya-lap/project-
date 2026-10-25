@@ -1,4 +1,4 @@
-"""Each operation uses its own transaction; never share a UI connection with AI threads."""
+"""แต่ละคำสั่งทำงานในธุรกรรมของตนเอง ห้ามใช้การเชื่อมต่อร่วมกันระหว่างหน้าต่างโปรแกรมกับเธรด AI"""
 import hashlib
 import os
 from pathlib import Path
@@ -77,6 +77,6 @@ class Database:
                          (document_id, page_number))
 
     def delete_document(self, document_id):
-        """Delete metadata and child records, never the PDF file on disk."""
+        """ลบข้อมูลเอกสารและข้อมูลที่เกี่ยวข้องในฐานข้อมูล โดยเก็บไฟล์ PDF บนเครื่องไว้"""
         with self.connect() as conn:
             conn.execute('DELETE FROM documents WHERE id=%s', (document_id,))
